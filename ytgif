@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""ytgif - cut a clip from a YouTube video and turn it into a captioned GIF.
+
+    ytgif URL START END "TEXT" [-o name] [--top] [--width 640] [--fps 25] [--mp4]
+
+Timestamps: SS, MM:SS or HH:MM:SS (decimals allowed). Separate caption phrases
+with " - " or "|" to show them one after another. Output goes to $GIF_LIBRARY
+(default ~/gifs).
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from pathlib import Path
+
+from PIL import ImageFont
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/open-sans/OpenSans-Bold.ttf",
+]
+
+
+def die(msg):
+    sys.exit(f"ytgif: {msg}")
+
+
+def parse_ts(ts):
+    parts = ts.split(":")
+    if not 1 <= len(parts) <= 3:
+        die(f"bad timestamp {ts!r}")
+    try:
+        secs = 0.0
+        for p in parts:
+            secs = secs * 60 + float(p)
+    except ValueError:
+        die(f"bad timestamp {ts!r}")
+    return secs
+
+
+def find_font(override):
+    for path in ([override] if override else FONT_CANDIDATES):
+        if path and Path(path).is_file():
+            return path
+    die("no bold font found; pass --font /path/to/font.ttf")
+
+
+def fit_text(text, font_path, width, max_lines, max_size):
+    """Pick the largest font size (<= max_size) whose wrapped text fits in
+    the frame width and max_lines. Returns (wrapped_text, size)."""
+    usable = width * 0.92
+    size = max_size
+    while size >= 12:
+        font = ImageFont.truetype(font_path, size)
+        lines = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split():
+                trial = f"{cur} {word}".strip()
+                if font.getlength(trial) <= usable:
+                    cur = trial
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = word
+            lines.append(cur)
+        if len(lines) <= max_lines and all(font.getlength(l) <= usable for l in lines):
+            return "\n".join(lines), size
+        size -= 2
+    die("text is too long to fit; shorten it or allow more lines with --max-lines")
+
+
+def upper(text):
+    """Uppercase; Greek capitals conventionally drop the tonos."""
+    nfd = unicodedata.normalize("NFD", text)
+    nfd = re.sub("(?<=[\u0370-\u03ff])\u0301", "", nfd)
+    return unicodedata.normalize("NFC", nfd).upper()
+
+
+def slugify(text):
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:50] or "clip"
+
+
+def download(url, start, end, workdir, browser):
+    out = str(workdir / "src.%(ext)s")
+    cmd = [
+        "yt-dlp", "--no-playlist", "--js-runtimes", "node", "--quiet", "--progress", "--no-warnings",
+        "-f", "bv*[height<=720]/b[height<=720]/bv*/b",
+        "--download-sections", f"*{start}-{end}",
+        "--force-keyframes-at-cuts",
+        "-o", out, url,
+    ]
+    if browser:
+        cmd[1:1] = ["--cookies-from-browser", browser]
+    if subprocess.run(cmd).returncode != 0:
+        die("yt-dlp failed (check the URL and timestamps; if YouTube asked you to sign in, "
+            "try --browser firefox)")
+    files = sorted(workdir.glob("src.*"))
+    if not files:
+        die("download produced no file")
+    return files[0]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="YouTube clip -> captioned GIF")
+    ap.add_argument("url")
+    ap.add_argument("start", help="start time, e.g. 1:23 or 83.5")
+    ap.add_argument("end", help="end time")
+    ap.add_argument("text", nargs="?", default="",
+                    help="caption; separate phrases with ' - ' or '|' to show them one after another")
+    ap.add_argument("-o", "--name", help="output name (default: from caption)")
+    pos = ap.add_mutually_exclusive_group()
+    pos.add_argument("--top", action="store_true", help="caption at the top")
+    pos.add_argument("--bottom", action="store_true", help="caption at the bottom (default)")
+    ap.add_argument("--width", type=int, default=640, help="output width in px (default 640)")
+    ap.add_argument("--fps", type=int, default=25)
+    ap.add_argument("--mp4", action="store_true", help="also write a high-quality silent .mp4")
+    ap.add_argument("--max-lines", type=int, default=1)
+    ap.add_argument("--interval", type=float,
+                    help="seconds each caption phrase is shown (default: clip split evenly)")
+    ap.add_argument("--no-upper", action="store_true", help="keep the caption's case")
+    ap.add_argument("--font", help="path to a .ttf to use")
+    ap.add_argument("--browser", default=os.environ.get("YTGIF_BROWSER"),
+                    help="read YouTube cookies from this browser (e.g. firefox, brave), "
+                         "needed when YouTube shows a bot check (env: YTGIF_BROWSER; off by default)")
+    ap.add_argument("--out-dir", default=os.environ.get("GIF_LIBRARY", "~/gifs"))
+    a = ap.parse_args()
+
+    local = Path(a.url).expanduser().is_file()
+    for tool in ("ffmpeg",) if local else ("yt-dlp", "ffmpeg"):
+        if not shutil.which(tool):
+            die(f"{tool} not found in PATH")
+
+    t0, t1 = parse_ts(a.start), parse_ts(a.end)
+    if t1 <= t0:
+        die("end must be after start")
+    if t1 - t0 > 30:
+        print(f"ytgif: warning: {t1 - t0:.0f}s clip will make a big GIF", file=sys.stderr)
+
+    out_dir = Path(a.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = slugify(a.name or a.text or Path(a.url).stem or "clip")
+    out = out_dir / f"{name}.gif"
+    n = 2
+    while out.exists():
+        out = out_dir / f"{name}-{n}.gif"
+        n += 1
+
+    with tempfile.TemporaryDirectory(prefix="ytgif-") as tmp:
+        tmp = Path(tmp)
+        if local:  # local file: cut during the ffmpeg pass
+            src, seek = Path(a.url).expanduser(), ["-ss", str(t0), "-to", str(t1)]
+        else:
+            src, seek = download(a.url, a.start, a.end, tmp, a.browser), []
+
+        out_w = a.width
+        vf = ["setpts=PTS-STARTPTS", f"fps={a.fps}", f"scale={out_w}:-2:flags=lanczos",
+              "unsharp=5:5:0.8:5:5:0"]
+        segments = [seg.strip() for seg in re.split(r"\s+-\s+|\s*\|\s*", a.text) if seg.strip()]
+        if segments:
+            if not a.no_upper:
+                segments = [upper(seg) for seg in segments]
+            font = find_font(a.font)
+            max_size = int(out_w * 0.14)
+            # one common size so the subtitles don't jump around between phrases
+            size = min(fit_text(seg, font, out_w, a.max_lines, max_size)[1] for seg in segments)
+            step = a.interval or (t1 - t0) / len(segments)
+            margin = max(10, out_w // 24)
+            y = f"{margin}" if a.top else f"h-line_h-{margin}"
+            for i, seg in enumerate(segments):
+                wrapped, _ = fit_text(seg, font, out_w, a.max_lines, size)
+                textfile = tmp / f"caption{i}.txt"
+                textfile.write_text(wrapped, encoding="utf-8")
+                enable = f"gte(t,{i * step:.3f})"
+                if i < len(segments) - 1:
+                    enable += f"*lt(t,{(i + 1) * step:.3f})"
+                vf.append(
+                    f"drawtext=fontfile={font}:textfile={textfile}:fontsize={size}"
+                    f":fontcolor=white:borderw={max(2, size // 12)}:bordercolor=black"
+                    f":line_spacing={size // 10}:x=(w-text_w)/2:y={y}:enable='{enable}'"
+                )
+        chain = ",".join(vf)
+        # per-frame palettes + error-diffusion dithering: much cleaner than a shared palette
+        graph = (f"{chain},split[a][b];[a]palettegen=stats_mode=single[p];"
+                 "[b][p]paletteuse=new=1:dither=sierra2_4a")
+
+        base = ["ffmpeg", "-v", "error", "-y", *seek, "-i", str(src), "-an"]
+        outputs = [out]
+        jobs = [base + ["-filter_complex", graph, "-loop", "0", str(out)]]
+        if a.mp4:
+            mp4 = out.with_suffix(".mp4")
+            outputs.append(mp4)
+            jobs.append(base + ["-vf", chain, "-c:v", "libx264", "-crf", "16", "-preset", "slow",
+                                "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4)])
+        for job in jobs:
+            if subprocess.run(job).returncode != 0:
+                die("ffmpeg failed")
+
+    for o in outputs:
+        print(f"{o}  ({o.stat().st_size / 1e6:.1f} MB)")
+    mb = out.stat().st_size / 1e6
+    if mb > 8:
+        print("ytgif: GIF is large for chat apps; try --width 480, --fps 15 or --mp4", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
