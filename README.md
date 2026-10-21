@@ -37,12 +37,37 @@ ln -s "$PWD/ytgif" ~/.local/bin/ytgif
 | `--interval` | clip / phrases | seconds per caption phrase |
 | `--max-lines` | 1 | wrap long captions instead of shrinking them |
 | `--no-upper` | off | keep the caption's case |
-| `--font` | Liberation Sans Bold | path to a `.ttf` |
-| `--browser` | off | read YouTube cookies from a browser, e.g. `firefox` (or `$YTGIF_BROWSER`) |
+| `--font` | Liberation Sans Bold | path to a `.ttf` (required on macOS/Windows, see below) |
+| `--browser` | off | borrow your browser's YouTube login if you hit the bot check (or `$YTGIF_BROWSER`, see below) |
 
 A local video file works in place of the URL.
 
-If YouTube answers "Sign in to confirm you're not a bot", sign in to YouTube in your
-browser and pass `--browser firefox`. Cookies are read in memory and never saved.
+## Fonts
+
+The default font is Liberation Sans Bold (or Open Sans Bold), looked up at common Linux
+paths. On macOS and Windows, or if no font is found, pass one explicitly:
+
+```
+ytgif URL 0:50 0:53 "TEXT" --font /path/to/Font-Bold.ttf
+```
+
+## "Sign in to confirm you're not a bot"
+
+Depending on your IP address, YouTube may refuse anonymous downloads. If you see this
+error, sign in to YouTube in your browser and let `yt-dlp` borrow that session:
+
+```
+ytgif URL 0:50 0:53 "TEXT" --browser firefox      # or chrome, brave, edge, ...
+export YTGIF_BROWSER=firefox                      # make it the default
+```
+
+`--browser` is off by default. What it means for your cookies:
+
+- `yt-dlp` reads your browser's cookie store and uses your YouTube login to make the
+  request, so it acts as you on YouTube. Only use it on a machine and browser profile you trust.
+- ytgif does not save, copy or upload the cookies. They are read each run and kept in memory.
+- YouTube can flag accounts that download automatically (see the
+  [yt-dlp FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ)), so consider signing in with a
+  secondary account.
 
 Please respect copyright and YouTube's terms of service; this is meant for personal use.
