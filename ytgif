@@ -90,7 +90,7 @@ def slugify(text):
 def download(url, start, end, workdir, browser):
     out = str(workdir / "src.%(ext)s")
     cmd = [
-        "yt-dlp", "--no-playlist", "--js-runtimes", "node", "--quiet", "--progress", "--no-warnings",
+        "yt-dlp", "--no-playlist", "--js-runtimes", "node", "--quiet", "--progress",
         "-f", "bv*[height<=720]/b[height<=720]/bv*/b",
         "--download-sections", f"*{start}-{end}",
         "--force-keyframes-at-cuts",
@@ -98,7 +98,16 @@ def download(url, start, end, workdir, browser):
     ]
     if browser:
         cmd[1:1] = ["--cookies-from-browser", browser]
-    if subprocess.run(cmd).returncode != 0:
+    # Progress goes to stdout; warnings and errors go to stderr. Keep stderr
+    # quiet on success, but show all of it on failure: the warnings usually
+    # hold the real cause (e.g. a failed JS challenge leaving no video formats).
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, errors="replace")
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        if "challenge solving failed" in result.stderr:
+            die("yt-dlp couldn't solve YouTube's JS challenge; YouTube probably changed its "
+                "player. Update with: pip install -U yt-dlp yt-dlp-ejs (if that's not "
+                "enough yet, check https://github.com/yt-dlp/yt-dlp/issues)")
         die("yt-dlp failed (check the URL and timestamps; if YouTube asked you to sign in, "
             "try --browser firefox)")
     files = sorted(workdir.glob("src.*"))
